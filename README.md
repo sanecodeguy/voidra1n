@@ -13,7 +13,7 @@ before kevent registration completes, leaving a dangling knote. `kevent64()` the
 
 CPU-affinity LIFO zone reclaim achieves ~70% success rate for the double-free.
 
-![screenshot](screenshot.jpeg)
+<img src="screenshot.jpeg" width="200" alt="voidra1n">
 
 ## Build
 
