@@ -19,7 +19,7 @@ CPU-affinity LIFO zone reclaim achieves ~70% success rate for the double-free.
 
 ## Build
 
-Requires [xtool](https://github.com/crazymind90/xtool) and the Darwin Swift SDK.
+Requires [xtool](https://github.com/xtool-org/xtool) and the Darwin Swift SDK.
 
     export PATH=$HOME/swift/bin:$PATH
     xtool dev run --usb
