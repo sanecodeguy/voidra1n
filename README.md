@@ -13,6 +13,8 @@ before kevent registration completes, leaving a dangling knote. `kevent64()` the
 
 CPU-affinity LIFO zone reclaim achieves ~70% success rate for the double-free.
 
+![screenshot](screenshot.jpeg)
+
 ## Build
 
 Requires [xtool](https://github.com/crazymind90/xtool) and the Darwin Swift SDK.
