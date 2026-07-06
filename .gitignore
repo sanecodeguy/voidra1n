@@ -1,0 +1,5 @@
+.build/
+xtool/
+.DS_Store
+*.swp
+*.swo
