@@ -17,7 +17,7 @@ import os
 
 try:
     import capstone as cs
-    MD = cs.Cs(cs.CS_ARCH_AARCH64, cs.CS_MODE_LITTLE_ENDIAN)
+    MD = cs.Cs(cs.CS_ARCH_ARM64, cs.CS_MODE_LITTLE_ENDIAN)
     MD.detail = True
     MD.skipdata = True
     HAS_CAPSTONE = True
@@ -49,92 +49,130 @@ def decompress_kernelcache(path):
     with open(path, 'rb') as f:
         data = f.read()
 
-    if data[:4] == b'IM4P':
-        try:
-            import pyimg4
-            img4 = pyimg4.IMG4(data)
-            payload = img4.payload.payload
-            print(f"[*] Decompressed IMG4: {len(payload)} bytes")
-            return payload
-        except Exception as e:
-            print(f"[!] pyimg4 IMG4 failed: {e}")
-
-    # Try various compression formats
-    for name, magic in [("LZSS", b'\xff\xff\xff\xff'),
-                          ("ASN1", b'\x30'),
-                          ("xm3c", b'xm3c')]:
-        if data[:len(magic)] == magic:
-            print(f"[*] Detected {name} compression")
-            try:
-                import pyimg4
-                decompressed = pyimg4.decompress(data)
-                print(f"[*] Decompressed: {len(decompressed)} bytes")
-                return decompressed
-            except Exception as e:
-                print(f"[!] {name} decompress failed: {e}")
-
-    if data[:4] in (b'\xfe\xed\xfa\xce', b'\xcf\xfa\xed\xfe'):
+    # Check for Mach-O magics (already decompressed)
+    if data[:4] in (b'\xfe\xed\xfa\xce', b'\xfe\xed\xfa\xcf',
+                    b'\xce\xfa\xed\xfe', b'\xcf\xfa\xed\xfe'):
         print("[*] Already a Mach-O, no decompression needed")
         return data
+
+    # IM4P starts with ASN.1 SEQUENCE (0x30)
+    try:
+        from pyimg4 import IM4P, lzfse
+        im4p = IM4P(data)
+        if im4p.fourcc == b'krnl' or im4p.fourcc == 'krnl':
+            print(f"[*] IM4P kernel: {im4p.description}")
+            payload = im4p.payload
+            if payload.compression == 2:  # LZFSE
+                dec = lzfse.decompress(payload.data)
+            else:
+                dec = payload.data
+            print(f"[*] Decompressed: {len(dec)} bytes")
+            return dec
+    except Exception as e:
+        print(f"[!] pyimg4 IM4P parse failed: {e}")
 
     print("[!] Unknown format, using raw data")
     return data
 
+FAT_MAGIC = 0xcafebabe
+FAT_MAGIC_64 = 0xcafebabf
+MH_MAGIC = 0xfeedface
+MH_CIGAM = 0xcefaedfe
+MH_MAGIC_64 = 0xfeedfacf
+MH_CIGAM_64 = 0xcffaedfe
+
 def find_macho(data):
     """Find the Mach-O header within the data (handle FAT)."""
     offset = 0
-    if data[:4] == b'\xcf\xfa\xed\xfe':
-        narch = struct.unpack_from('<I', data, 4)[0]
-        for i in range(narch):
-            cpu_type = struct.unpack_from('<I', data, 8 + i*20)[0]
-            if cpu_type == 0x100000C:  # ARM64
-                offset = struct.unpack_from('<I', data, 8 + i*20 + 8)[0]
-                break
-        print(f"[*] FAT binary, arm64 offset: 0x{offset:x}")
+    magic = struct.unpack_from('<I', data, 0)[0]
+    if magic in (FAT_MAGIC, FAT_MAGIC_64, MH_CIGAM, MH_MAGIC,
+                 MH_CIGAM_64, MH_MAGIC_64):
+        pass  # valid Mach-O or FAT
+    else:
+        return None, None
 
-    if data[offset:offset+4] != b'\xfe\xed\xfa\xce':
+    # Handle FAT binaries: magic bytes are always big-endian
+    fat32_magic = struct.unpack_from('>I', data, 0)[0]
+    fat64_magic = struct.unpack_from('>I', data, 0)[0]
+    if fat32_magic == 0xcafebabe or fat64_magic == 0xcafebabf:
+        # FAT binary
+        is_64 = (fat64_magic == 0xcafebabf)
+        header_size = 32 if is_64 else 20
+        narch = struct.unpack_from('>I', data, 4)[0]
+        for i in range(narch):
+            cpu_type = struct.unpack_from('>I', data, 8 + i*header_size)[0]
+            if cpu_type & 0x01000000:  # CPU_ARCH_ABI64
+                offset = struct.unpack_from('>I', data, 8 + i*header_size + 8)[0]
+                print(f"[*] FAT binary, arm64 offset: 0x{offset:x}")
+                break
+        else:
+            print("[!] No arm64 slice found in FAT binary")
+            return None, None
+
+    macho_magic = struct.unpack_from('<I', data, offset)[0]
+    if macho_magic not in (MH_MAGIC, MH_CIGAM, MH_MAGIC_64, MH_CIGAM_64):
         return None, None
     return data[offset:], offset
 
 def parse_macho(data, base_offset=0):
-    """Parse Mach-O header and return (base_addr, text_start, text_end, sections)."""
+    """Parse Mach-O header and return (base_addr, text_start, text_end, segments).
+    segments dict: segname -> {vmaddr, vmsize, fileoff, filesize, sections: {sectname: (addr, size, fileoff)}}
+    """
     ncmds = struct.unpack_from('<I', data, 16)[0]
     cmd_offset = 32
-    base = None
-    text_start = None
-    text_end = None
-    sections = {}
+    segments = {}
 
     for _ in range(ncmds):
         cmd = struct.unpack_from('<I', data, cmd_offset)[0]
         cmdsize = struct.unpack_from('<I', data, cmd_offset + 4)[0]
 
-        if cmd == 0x1C:  # LC_SEGMENT_64
+        if cmd == 0x19:  # LC_SEGMENT_64
+            segname = data[cmd_offset+8:cmd_offset+24].rstrip(b'\x00').decode(errors='replace')
             vmaddr = struct.unpack_from('<Q', data, cmd_offset + 24)[0]
-            if base is None:
-                base = vmaddr
+            vmsize = struct.unpack_from('<Q', data, cmd_offset + 32)[0]
+            fileoff = struct.unpack_from('<Q', data, cmd_offset + 40)[0]
+            filesize = struct.unpack_from('<Q', data, cmd_offset + 48)[0]
+            nsects = struct.unpack_from('<I', data, cmd_offset + 64)[0]
 
-        elif cmd == 0x19:  # LC_SEGMENT_64 with sections
-            nsects = struct.unpack_from('<I', data, cmd_offset + 20)[0]
-            segname = data[cmd_offset+8:cmd_offset+24].rstrip(b'\x00').decode()
-            seg_off = cmd_offset + 32
-            for _ in range(nsects):
-                sectname = data[seg_off:seg_off+16].rstrip(b'\x00').decode()
-                s_segname = data[seg_off+16:seg_off+32].rstrip(b'\x00').decode()
-                addr = struct.unpack_from('<Q', data, seg_off + 32)[0]
-                size = struct.unpack_from('<Q', data, seg_off + 40)[0]
-                fileoff = struct.unpack_from('<Q', data, seg_off + 48)[0]
-                sections[sectname] = (addr, size, fileoff)
-                if s_segname == '__TEXT' and sectname == '__text':
-                    text_start = addr
-                    text_end = addr + size
-                seg_off += 80
+            sections = {}
+            # Only parse sections for segments we need (skip __TEXT which has 20000+ prelink sections)
+            if segname in ('__TEXT_EXEC', '__DATA', '__DATA_CONST', '__DATA_DIRTY', '__PPLTEXT', '__PPLDATA'):
+                seg_off = cmd_offset + 72
+                for _ in range(nsects):
+                    sectname = data[seg_off:seg_off+16].rstrip(b'\x00').decode(errors='replace')
+                    addr = struct.unpack_from('<Q', data, seg_off + 32)[0]
+                    size = struct.unpack_from('<Q', data, seg_off + 40)[0]
+                    s_fileoff = struct.unpack_from('<I', data, seg_off + 48)[0]
+                    sections[sectname] = (addr, size, s_fileoff)
+                    seg_off += 80
+
+            segments[segname] = {
+                'vmaddr': vmaddr,
+                'vmsize': vmsize,
+                'fileoff': fileoff,
+                'filesize': filesize,
+                'sections': sections,
+            }
 
         cmd_offset += cmdsize
 
+    base = segments.get('__TEXT', {}).get('vmaddr')
+    text_start = text_end = None
+    if '__TEXT_EXEC' in segments:
+        tex = segments['__TEXT_EXEC']
+        text_sect = tex.get('sections', {}).get('__text')
+        if text_sect:
+            text_start, text_size, _ = text_sect
+            text_end = text_start + text_size
+        else:
+            # No individual sections — the whole segment is the executable
+            text_start = tex['vmaddr']
+            text_end = text_start + tex['vmsize']
+
     print(f"[*] Kernel base: 0x{base:x}")
-    print(f"[*] __text: 0x{text_start:x} - 0x{text_end:x} ({text_end - text_start} bytes)")
-    return base, text_start, text_end, sections
+    if text_start and text_end:
+        print(f"[*] __TEXT_EXEC.__text: 0x{text_start:x} - 0x{text_end:x} ({text_end - text_start} bytes)")
+    return base, text_start, text_end, segments
 
 def find_version_string(data):
     """Find kernel version strings."""
@@ -148,14 +186,22 @@ def find_version_string(data):
         return data[idx:end].decode(errors='replace')
     return None
 
-def find_global_by_adrp_ldr(data, text_start, text_end, sections, hint_name=""):
+def find_global_by_adrp_ldr(data, text_start, text_end, segments, hint_name=""):
     """Find a global variable accessed via ADRP+LDR pattern.
     Returns list of (load_addr, global_addr) tuples.
     """
     if not HAS_CAPSTONE:
         return []
 
-    text_fileoff = sections.get('__text', (0, 0, 0))[2]
+    exec_seg = segments.get('__TEXT_EXEC', {})
+    text_sect = exec_seg.get('sections', {}).get('__text')
+    if text_sect:
+        text_fileoff = text_sect[2]
+    elif exec_seg:
+        # No sections — use segment fileoff
+        text_fileoff = exec_seg.get('fileoff', 0)
+    else:
+        return []
     if text_fileoff == 0:
         return []
 
@@ -194,12 +240,12 @@ def find_global_by_adrp_ldr(data, text_start, text_end, sections, hint_name=""):
     print(f"[*] Found {len(results)} global candidates")
     return results
 
-def find_allproc(text_start, text_end, data, sections, base):
+def find_allproc(text_start, text_end, data, segments, base):
     """Find allproc by looking for ADRP+LDR in proc_find or similar function.
     allproc is the head of a linked list; look for LDR that loads a pointer
     that is then immediately dereferenced (next pointer access).
     """
-    globals_found = find_global_by_adrp_ldr(data, text_start, text_end, sections, "allproc")
+    globals_found = find_global_by_adrp_ldr(data, text_start, text_end, segments, "allproc")
     if not globals_found:
         return None
 
@@ -207,7 +253,12 @@ def find_allproc(text_start, text_end, data, sections, base):
     # Look for the address that appears most often in LDR targets
     # near loops (conditional branches back).
     from collections import Counter
-    file_off = sections.get('__text', (0, 0, 0))[2]
+    exec_seg = segments.get('__TEXT_EXEC', {})
+    text_sect = exec_seg.get('sections', {}).get('__text')
+    if text_sect:
+        file_off = text_sect[2]
+    else:
+        file_off = exec_seg.get('fileoff', 0)
     pc = text_start
     file_end = file_off + (text_end - text_start)
     target_count = Counter()
@@ -256,42 +307,59 @@ def main():
     version = find_version_string(macho)
     print(f"[*] Version: {version}")
 
-    base, text_start, text_end, sections = parse_macho(macho, fat_off)
+    base, text_start, text_end, segments = parse_macho(macho, fat_off)
 
     print(f"\n{'='*50}")
     print(f"  FINDING KEY GLOBALS")
     print(f"{'='*50}")
 
-    # allproc - uses reference counting pattern
-    allproc = find_allproc(text_start, text_end, macho, sections, base)
+    # Scan __TEXT_EXEC for all ADRP+LDR targets
+    from collections import Counter
+    exec_seg = segments.get('__TEXT_EXEC', {})
+    text_sect = exec_seg.get('sections', {}).get('__text')
+    if text_sect:
+        scan_fileoff = text_sect[2]
+    else:
+        scan_fileoff = exec_seg.get('fileoff', 0)
+    scan_file_end = scan_fileoff + (text_end - text_start)
+    scan_pc = text_start
+    target_count = Counter()
 
-    # kernel_task - often found near allproc
+    while scan_fileoff < scan_file_end:
+        raw_insn = struct.unpack_from('<I', macho, scan_fileoff)[0]
+        if (raw_insn & 0x9F000000) == 0x90000000:
+            immhi = (raw_insn >> 5) & 0x7FFFF
+            immlo = (raw_insn >> 29) & 0x3
+            imm = (immhi << 2) | immlo
+            if imm & (1 << 20):
+                imm |= ~((1 << 21) - 1)
+            page = (scan_pc & ~0xFFF) + (imm << 12)
+            next_raw = struct.unpack_from('<I', macho, scan_fileoff + 4)[0]
+            if (next_raw & 0xFFC00000) == 0xF9400000:
+                ldr_off = ((next_raw >> 10) & 0xFFF) << 3
+                target = page + ldr_off
+                if target >= 0xfffffff000000000:
+                    target_count[target] += 1
+        scan_fileoff += 4
+        scan_pc += 4
+
+    top = target_count.most_common()
+    print(f"[*] Found {len(top)} unique global targets")
+
+    allproc = None
     kernel_task = None
-
-    if allproc:
-        # kernel_task is typically at allproc +/- some offset
-        # Scan near allproc in __data
-        data_start = sections.get('__data', (0, 0, 0))[0]
-        data_size = sections.get('__data', (0, 0, 0))[1]
-        data_fileoff = sections.get('__data', (0, 0, 0))[2]
-
-        # Find kernel_task by scanning adjacent globals
-        allproc_idx_in_file = allproc - base + fat_off
-        # kernel_task is often 8 or 16 bytes before/after allproc
-        for delta in [0x8, 0x10, -0x8, -0x10]:
-            check_addr = allproc + delta
-            file_check = check_addr - base + fat_off
-            if 0 <= file_check < len(macho):
-                val = struct.unpack_from('<Q', macho, file_check)[0]
-                if val >= 0xfffffff000000000 and (val & 0xFFF) == 0:
-                    kernel_task = check_addr
-                    print(f"[*] kernel_task candidate at 0x{kernel_task:x} (delta=0x{delta:x})")
-                    break
-
-    # zone_map - referenced from osmalloc_zone_map or similar
     zone_map = None
+    IPC_SPACE_KERNEL = None
 
-    IPC_SPACE_KERNEL = 0xfffffff0076282D0 + 0x9814000  # from earlier research
+    for addr, refs in top[:5]:
+        print(f"    {addr:016x}  ({refs} refs)")
+
+    if len(top) >= 1:
+        allproc = top[0][0]
+    if len(top) >= 2:
+        kernel_task = top[1][0]
+    if len(top) >= 3:
+        zone_map = top[2][0]  # may need refinement
 
     # Print results
     print(f"\n{'='*50}")

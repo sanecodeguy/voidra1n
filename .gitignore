@@ -3,3 +3,5 @@ xtool/
 .DS_Store
 *.swp
 *.swo
+*.ipsw
+kernelcache.release.*
